@@ -234,12 +234,11 @@ class Instruction
   end
 
   def self.match(s, instr: false)
-    @@instructions.each do |m, is|
-      is.each do |i|
-        r = i.match s
-        return i if r and instr
-        return i.blit(r) if r
-      end
+    mnem = s.split.first.to_sym
+    @@instructions[mnem].each do |i|
+      r = i.match s
+      return i if r and instr
+      return i.blit(r) if r
     end
     STDERR.puts "WARNING: #{s} is not a valid instruction / encoding"
     []
