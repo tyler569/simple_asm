@@ -1,182 +1,280 @@
+#!/usr/bin/env ruby
 require 'optparse'
 
-options = {}
+$options = {
+  mode: 'simple'
+}
 
 OptionParser.new do |opts|
-  opts.on('-f', '--file FILE', 'ASM file to assemble') { |f| options[:file] = f }
-  opts.on('-t', '--test', 'Self test') { options[:test] = true }
+  opts.on('-f', '--file FILE', 'ASM file to assemble') { |f| $options[:file] = f }
+  opts.on('-t', '--test', 'Self test') { $options[:test] = true }
+  opts.on('-d', '--debug', 'Debug!') { $options[:debug] = 0 }
+  opts.on('-m', '--mode MODE', 'Select a mode') { |v| $options[:mode] = v }
 end.parse!
 
-#
-# r0 ZR
-# r1 config
-# r2 PC lower
-# r3
-# r4
-# r5 tos
-# r6 acc
-# r7 sp
-#
-
-# Encoding:
-# c 1 bit register r5 - r6
-# R 2 bit register r4 - r7
-# r 3 bit register r0 - r7
-# A accumulator
-# n number 
-INSTRUCTIONS = File.read("instructions")
-
 class Instruction
-  attr_reader :format, :encoding, :mnemonic, :arg_map
+  attr_reader :format, :encoding, :mnemonic, :format_parts
+  attr_reader :internal_format
 
-  ARG_TYPES = {
-    'A' => :accumulator,
-    'c' => :register1,
-    'R' => :register2,
-    'r' => :register3,
-    'n' => :number,
-  }
+  class SimpleArg
+    attr_reader :spec, :type, :n
 
-  @@instructions = Hash.new { |h, k| h[k] = [] }
+    def SimpleArg.from_part(part)
+      return part[1..] if part.start_with? '$'
+      return nil unless part =~ /\A(\w)(\d)\z/
+      return nil unless ARG_TYPES.include? $1
+      SimpleArg.new(part)
+    end
 
-  def format_parts
-    format.scan(/\w+|\S/)
-  end
+    def initialize(spec)
+      return nil unless spec =~ /\A(\w)(\d)\z/
+      return nil unless ARG_TYPES.include? $1
+      @spec = spec
+      @type = ARG_TYPES[$1]
+      @n = $2.to_i
+    end
 
-  def find_arg(c)
-    i = 0
-    @internal_format.each do |p|
-      if p.is_a? Symbol
-        break if p == ARG_TYPES[c]
-        i += 1
+    def to_s
+      "Arg(#{type}, #{n})"
+    end
+
+    private def render(number, bits)
+      (number & (2**bits-1)).to_s(2).rjust(bits, '0')
+    end
+
+    ARG_TYPES = {
+      'p' => :page,
+      'R' => :register,
+      'i' => :immediate4,
+      'I' => :immediate8,
+      'J' => :immediate16,
+      'j' => :jumpcond,
+      'g' => :oneop,
+      'h' => :twoop,
+      'L' => :label
+    }
+
+    JUMP_CONDS = {
+      'ja'  => 1,  'jnbe' => 1,
+      'jae' => 2,  'jnb' => 2,  'jnc' => 2,
+      'jb'  => 3,  'jnae' => 3, 'jc' => 3,
+      'jbe' => 4,  'jna' => 4,
+      'jg'  => 5,  'jnle' => 5,
+      'jge' => 6,  'jnl' => 6,
+      'jl'  => 7,  'jnge' => 7,
+      'jle' => 8,  'jng' => 8,
+      'jeq' => 9,  'je' => 9,   'jz' => 9,
+      'jne' => 10, 'jnz' => 10,
+      'jo'  => 11,
+      'jno' => 12,
+      'jmp' => 13,
+    }
+
+    ONE_OPS = {
+      'not'  => 1,
+      'inv'  => 2,
+      'push' => 3,
+      'pop'  => 4,
+      'inc'  => 5,
+      'dec'  => 6,
+    }
+
+    TWO_OPS = {
+      'add'  => 1,
+      'sub'  => 2,
+      'or'   => 3,
+      'nor'  => 4,
+      'and'  => 5,
+      'nand' => 6,
+      'xor'  => 7,
+      'xnor' => 8,
+      'adc'  => 9,
+      'sbb'  => 10,
+      'cmp'  => 11,
+    }
+
+    def match?(text)
+      case type
+      when :page
+        text =~ /\Ap(\d+)\z/ && $1.to_i.between?(0, 3)
+      when :register
+        text =~ /\Ar(\d+)\z/ && $1.to_i.between?(0, 15)
+      when :immediate4
+        Integer(text).between?(0, 15)
+      when :immediate8
+        Integer(text).between?(-128, 255)
+      when :immediate16
+        Integer(text).between?(-2**15, 2**16-1)
+      when :label
+        true
+      when :jumpcond
+        JUMP_CONDS.include? text
+      when :oneop
+        ONE_OPS.include? text
+      when :twoop
+        TWO_OPS.include? text
+      end
+    rescue ArgumentError
+      nil
+    end
+
+    def bits(text)
+      case type
+      when :page
+        render(text[1..].to_i, 2)
+      when :register
+        render(text[1..].to_i, 4)
+      when :immediate4
+        render(text.to_i, 4)
+      when :immediate8
+        render(text.to_i, 8)
+      when :immediate16
+        o = render(text.to_i, 16)
+        [o[0..8], o[8..16]]
+      when :label
+        ":#{text[..-1]}"
+      when :jumpcond
+        render(JUMP_CONDS[text], 4)
+      when :oneop
+        render(ONE_OPS[text], 4)
+      when :twoop
+        render(TWO_OPS[text], 4)
       end
     end
-    i
+  end
+
+  class CapoArg
+    attr_reader :spec, :type, :n
+
+    def CapoArg.from_part(part)
+      return part[1..] if part.start_with? '$'
+      return nil unless part =~ /\A(\w)(\d)\z/
+      return nil unless ARG_TYPES.include? $1
+      CapoArg.new(part)
+    end
+
+    def initialize(spec)
+      return nil unless spec =~ /\A(\w)(\d)\z/
+      return nil unless ARG_TYPES.include? $1
+      @spec = spec
+      @type = ARG_TYPES[$1]
+      @n = $2.to_i
+    end
+
+    def to_s
+      "Arg(#{type}, #{n})"
+    end
+
+    private def render(number, bits)
+      (number & (2**bits-1)).to_s(2).rjust(bits, '0')
+    end
+
+    ARG_TYPES = {
+      'A' => :accumulator,
+      'c' => :register1,
+      'r' => :register2,
+      'R' => :register3,
+      'n' => :number,
+    }
+
+    def match?(text)
+      case type
+      when :accumulator
+        text == "acc"
+      when :register1
+        text =~ /\Ar(\d+)\z/ && $1.to_i.between?(5, 6)
+      when :register2
+        text =~ /\Ar(\d+)\z/ && $1.to_i.between?(4, 7)
+      when :register3
+        text =~ /\Ar(\d+)\z/ && $1.to_i.between?(0, 7)
+      when :number
+        Integer(text).between?(-64, 127)
+      end
+    rescue ArgumentError
+      nil
+    end
+
+    def bits(text)
+      case type
+      when :accumulator
+        "Error - accumulator cannot be in bit representation"
+      when :register1
+        render(text.to_i - 5, 1)
+      when :register2
+        render(text.to_i - 4, 2)
+      when :register3
+        render(text.to_i, 3)
+      when :number
+        render(text.to_i, 7)
+      end
+    end
+  end
+
+  case $options[:mode]
+  when 'simple'
+    Arg = SimpleArg
+  when 'capo'
+    Arg = CapoArg
+  end
+
+  private def scan(text)
+    text.scan(/\$?\w+|\S/)
   end
 
   def initialize(s)
     @format, @encoding = s.split(';').map(&:strip)
     @mnemonic = format.split.first
+    @format_parts = scan format
 
-    @internal_format = format_parts.map do |p|
-      ARG_TYPES[p] || p
-    end
-
-    @arg_map = []
-    last_c = nil
-    encoding.chars do |c|
-      next if last_c == c
-      next unless ARG_TYPES.include? c
-      last_c = c
-
-      @arg_map << find_arg(c)
-    end
-
+    @internal_format = format_parts.map { |p| Arg.from_part(p) || p }
     @internal_encoding = encoding.split('+').map(&:strip)
   end
 
-  def self.from_register(r)
-    case r
-    when /\Ar\d+\z/
-      r[1..].to_i
-    when 'config'
-      1
-    when 'tos'
-      5
-    when 'acc'
-      6
-    when 'sp'
-      7
-    else
-      nil
+  def encode(text)
+    puts "--- #{self}" if $options[:debug] > 1
+    tokens = scan text
+    return nil unless tokens.length == format_parts.length
+    values = {'%' => tokens[0]}
+    internal_format.zip(tokens).each do |f, t|
+      puts "#{f} / #{t}" if $options[:debug] > 1
+      case f
+      when String
+        return nil unless f == t
+      when Arg
+        return nil unless f.match? t
+        values[f.spec] = f.bits t
+      end
     end
-  end
+    puts "#{text} : #{self} : #{values}" if $options[:debug]
 
-  def match(s)
-    parts = s.scan /\w+|\S/
-    return nil unless parts.length == @internal_format.length
-    registers = []
-    @internal_format.each_with_index do |p, i|
-      case p
-      when :register1, :register2, :register3, :accumulator
-        r = Instruction.from_register parts[i]
-        return nil unless r
-        case p
-        when :accumulator
-          return nil unless r == 6
-        when :register1
-          return nil unless (5..6) === r
-        when :register2
-          return nil unless (4..7) === r
-        when :register3
-          return nil unless (0..7) === r
+    @internal_encoding.flat_map do |e|
+      case
+      when e.start_with?('#')
+        out = e[1..]
+        values.each do |k, v|
+          next unless v.is_a? String
+          out.sub!(k, v)
         end
-
-        registers << r
-      when :number
-        return nil unless parts[i] =~ /\A\d+\z/
-        registers << parts[i].to_i
+        out
+      when e.start_with?('@')
+        values[e[1..]]
       else
-        return nil unless parts[i] == p
+        # TODO
       end
     end
-    registers
-  end
-
-  def blit(arguments)
-    i = 0
-    @internal_encoding.map do |e|
-      arg = arguments[arg_map[i]] rescue 0
-      # puts "#{i}, #{arguments}, #{arg_map}, #{arg}"
-      if e[0] != '#'
-        v = Instruction.match(e.gsub(/\bn\b/, arg.to_s))
-      else
-        v = e[1..]
-          .gsub('c',       (arg - 5).to_s(2).rjust(1, '0'))
-          .gsub('RR',      (arg - 4).to_s(2).rjust(2, '0'))
-          .gsub('rrr',     (arg    ).to_s(2).rjust(3, '0'))
-          .gsub('nnnnnnn', (arg    ).to_s(2).rjust(7, '0'))
-          .to_i(2)
-      end
-      i += 1
-      v
-    end.flatten
   end
 
   def to_s
-    "Instruction(#{format}, #{encoding})"
-  end
-
-  def self.load(instruction_defs)
-    instruction_defs.lines.each do |i|
-      next if i.strip == ""
-      instr = Instruction.new i
-      @@instructions[instr.mnemonic.to_sym] << instr
-    end
-  end
-
-  def self.match(s, instr: false)
-    mnem = s.split.first.to_sym
-    @@instructions[mnem].each do |i|
-      r = i.match s
-      return i if r and instr
-      return i.blit(r) if r
-    end
-    STDERR.puts "WARNING: #{s} is not a valid instruction / encoding"
-    []
+    "Instruction(#{format}; #{encoding})"
   end
 end
-
-Instruction.load(INSTRUCTIONS)
 
 def output(arr)
   arr.map { |i| i.to_s(2).rjust(8, '0') }
 end
 
 def check(example, correct)
-  actual = Instruction.match(example)
   if actual != correct
-    instr = Instruction.match(example, instr: true)
     puts "#{example} is wrong!"
     puts "  matched: #{instr}"
     puts "  got:     #{output actual}"
@@ -186,27 +284,59 @@ def check(example, correct)
   end
 end
 
-if options[:test]
-  check "add r5, 4",        [0b1000_0100, 0b0100_1000]
-  check "ld r6, [r7 + 10]", [0b1000_1010, 0b0101_0111]
-  check "add acc",          [0b0000_0010]
-  check "mov r5, acc",      [0b0010_0101]
-  check "mov acc, r2",      [0b0010_1010]
-  check "jmp 127",          [0b1111_1111, 0b0110_1000]
-  check "jmp r7",           [0b0110_1100]
-  check "rtn",              [0b0110_1010]
-  check "jz 10",            [0b1000_1010, 0b0111_1000, 0b0110_1000]
-  check "mov acc, sp",      [0b0010_1111]
-  check "add r12",          []
+$all = []
+
+file = case $options[:mode]
+       when 'simple'
+         'simple16'
+       when 'capo'
+         'capo'
+       end
+
+File.read(file).lines do |line|
+  next if line.strip.empty?
+  next if line.strip.start_with? '#'
+
+  i = Instruction.new(line)
+  $all << i
+  puts "#{i}   #{i.internal_format.map(&:to_s)}" if $options[:debug]
 end
 
-if options[:file]
-  puts File.read(options[:file])
-    .lines
-    .map(&:strip)
-    .reject(&:empty?)
-    .map { |l| Instruction.match(l) }
-    .flatten
-    .map { |l| l.to_s(16).rjust(2, '0') }
-    .join(" ")
+if $options[:test]
+end
+
+def is_label?(line)
+  line.end_with? ':'
+end
+
+def label(line)
+  "label:#{line[..-2]}"
+end
+
+def encode(i, line)
+  if is_label? line
+    label line
+  else
+    encoded = nil
+    $all.find { |i| encoded = i.encode(line) }
+    if encoded.nil?
+      STDERR.puts "#{line} (line #{i+1}) does not match any instruction or encoding"
+      exit 1
+    end
+    encoded
+  end
+end
+
+if $options[:file]
+  puts File.read($options[:file])
+      .lines
+      .each_with_index
+      .map { |line, i| [line.strip, i] }
+      .reject { |line, i| line.empty? }
+      .flat_map { |line, i| encode i, line }
+else
+  require 'readline'
+  while buf = Readline.readline('> ', true)
+    $all.find { |i| x = i.encode(buf); p x if x }
+  end
 end

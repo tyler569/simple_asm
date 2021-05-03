@@ -1,0 +1,43 @@
+# Encoding:
+# p 2 bit register page
+# R 4 bit register
+# i 4 bit immediate
+# I 8 bit immediate
+# J 16 bit immediate
+# j 4 bit jump condition
+# g 4 bit 1op
+# h 4 bit 2op
+
+# 2ops
+h0  R0, R1                  ; #0000h0 + #R0R1
+h0  R0, i0                  ; #0010h0 + #R0i0
+
+# 1ops
+g0  R0                      ; #00000000 + #g0R0
+
+mov R0, R1                  ; #1011R0 + #R10000
+mov [R0], R1                ; #0100R0 + #R10000
+mov R0, [R1]                ; #0101R0 + #R10000
+mov [R0 + R1], R2           ; #0100R0 + #R1R2
+mov R0, [R1 + R2]           ; #0100R0 + #R1R2
+mov R0, p0:R1               ; #1011R0 + #R100p0
+mov p0:R0, R1               ; #1011R0 + #R1p000
+mov p0:R0, p1:R1            ; #1011R0 + #R1p0p1
+li  R0, I0                  ; #1000R0 + #I0
+li  R0, J0                  ; #1001R0 + #00000000 + @J0
+mov R0, I0                  ; #1000R0 + #I0
+mov R0, J0                  ; #1001R0 + #00000000 + @J0
+
+j0  R0                      ; #0001j0 + #R00000
+j0  [R0]                    ; #0001j0 + #R00001
+j0  I0                      ; #0001j0 + #I0
+j0  J0                      ; #0001j0 + #00000010 + @J0
+j0  L0                      ; #%L0
+
+call R0                     ; #00011101 + #R00000
+call [R0]                   ; #00011101 + #R00001
+call J0                     ; #00011101 + #00000010 + @J0
+call L0                     ; #%L0
+
+ret                         ; #0 + #0
+
