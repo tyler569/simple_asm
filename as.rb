@@ -2,15 +2,22 @@
 require 'optparse'
 
 $options = {
-  mode: 'simple'
+  mode: 'simple',
+  debug: 0
 }
 
+$all = []
+
 OptionParser.new do |opts|
+  opts.on('-c', '--config CONFIG', 'Select a config file') { |v| $options[:mode] = v }
   opts.on('-f', '--file FILE', 'ASM file to assemble') { |f| $options[:file] = f }
   opts.on('-t', '--test', 'Self test') { $options[:test] = true }
-  opts.on('-d', '--debug', 'Debug!') { $options[:debug] = 0 }
-  opts.on('-m', '--mode MODE', 'Select a mode') { |v| $options[:mode] = v }
+  opts.on('-d', '--debug', 'Debug!') { $options[:debug] += 1 }
 end.parse!
+
+def is_byte?(v)
+  v.match /\A[01]+\z/
+end
 
 class Instruction
   attr_reader :format, :encoding, :mnemonic, :format_parts
@@ -93,12 +100,16 @@ class Instruction
       'cmp'  => 11,
     }
 
+    NAMED_REGISTERS = {
+      'sp' => 15,
+    }
+
     def match?(text)
       case type
       when :page
         text =~ /\Ap(\d+)\z/ && $1.to_i.between?(0, 3)
       when :register
-        text =~ /\Ar(\d+)\z/ && $1.to_i.between?(0, 15)
+        text =~ /\Ar(\d+)\z/ && $1.to_i.between?(0, 15) || NAMED_REGISTERS.include?(text)
       when :immediate4
         Integer(text).between?(0, 15)
       when :immediate8
@@ -123,16 +134,16 @@ class Instruction
       when :page
         render(text[1..].to_i, 2)
       when :register
-        render(text[1..].to_i, 4)
+        render(NAMED_REGISTERS[text] || text[1..].to_i, 4)
       when :immediate4
-        render(text.to_i, 4)
+        render(Integer(text), 4)
       when :immediate8
-        render(text.to_i, 8)
+        render(Integer(text), 8)
       when :immediate16
-        o = render(text.to_i, 16)
-        [o[0..8], o[8..16]]
+        o = render(Integer(text), 16)
+        [o[0..7], o[8..16]]
       when :label
-        ":#{text[..-1]}"
+        " #{text[..-1]}"
       when :jumpcond
         render(JUMP_CONDS[text], 4)
       when :oneop
@@ -166,7 +177,7 @@ class Instruction
     end
 
     private def render(number, bits)
-      (number & (2**bits-1)).to_s(2).rjust(bits, '0')
+      (number & (2**bits-1))
     end
 
     ARG_TYPES = {
@@ -211,14 +222,14 @@ class Instruction
   end
 
   case $options[:mode]
-  when 'simple'
+  when 'simple', 'simple16'
     Arg = SimpleArg
   when 'capo'
     Arg = CapoArg
   end
 
   private def scan(text)
-    text.scan(/\$?\w+|\S/)
+    text.scan(/0[xbo]\w+|-?\d+|\$?[\w.]+|\S/)
   end
 
   def initialize(s)
@@ -245,7 +256,7 @@ class Instruction
         values[f.spec] = f.bits t
       end
     end
-    puts "#{text} : #{self} : #{values}" if $options[:debug]
+    puts "#{text} : #{self} : #{values}" if $options[:debug] > 0
 
     @internal_encoding.flat_map do |e|
       case
@@ -255,11 +266,13 @@ class Instruction
           next unless v.is_a? String
           out.sub!(k, v)
         end
+        raise if is_byte?(out) && out.length != 8
         out
       when e.start_with?('@')
         values[e[1..]]
       else
         # TODO
+        # This is where something like recursive evaluation could go
       end
     end
   end
@@ -269,25 +282,8 @@ class Instruction
   end
 end
 
-def output(arr)
-  arr.map { |i| i.to_s(2).rjust(8, '0') }
-end
-
-def check(example, correct)
-  if actual != correct
-    puts "#{example} is wrong!"
-    puts "  matched: #{instr}"
-    puts "  got:     #{output actual}"
-    puts "  wanted:  #{output correct}"
-  else
-    puts "#{example.ljust(20)} #{output(actual).inspect.ljust(40)} ✓"
-  end
-end
-
-$all = []
-
 file = case $options[:mode]
-       when 'simple'
+       when 'simple', 'simple16'
          'simple16'
        when 'capo'
          'capo'
@@ -299,41 +295,113 @@ File.read(file).lines do |line|
 
   i = Instruction.new(line)
   $all << i
-  puts "#{i}   #{i.internal_format.map(&:to_s)}" if $options[:debug]
+  puts "#{i}   #{i.internal_format.map(&:to_s)}" if $options[:debug] > 0
 end
 
 if $options[:test]
+  # TODO
 end
 
 def is_label?(line)
   line.end_with? ':'
 end
 
-def label(line)
-  "label:#{line[..-2]}"
+def is_local_label?(line)
+  is_label?(line) && line.start_with?('.')
 end
 
-def encode(i, line)
+def label(line)
+  "label #{line[..-2]}"
+end
+
+$last_label = nil
+
+def expand_labels(line)
   if is_label? line
+    if is_local_label? line
+      "#{$last_label}#{line}"
+    else
+      $last_label = line[..2]
+      line
+    end
+  else
+    line.split.map do |w|
+      if w.start_with? '.'
+        "#{$last_label}#{w}"
+      else
+        w
+      end
+    end.join " "
+  end
+end
+
+def encode(line)
+  if is_byte? line
+    line
+  elsif is_label? line
     label line
   else
     encoded = nil
     $all.find { |i| encoded = i.encode(line) }
     if encoded.nil?
-      STDERR.puts "#{line} (line #{i+1}) does not match any instruction or encoding"
+      STDERR.puts "#{line} does not match any instruction or encoding"
       exit 1
     end
     encoded
   end
 end
 
+def expand_labels_relative(intermediate)
+  labels = {}
+  index = 0
+  intermediate.each do |i|
+    if is_byte? i
+      index += 1
+    elsif i.split[0] == 'label'
+      labels[i.split[1]] = index
+    else
+      index += 2
+    end
+  end
+  p labels
+  index = 0
+  intermediate.map do |i|
+    if is_byte? i
+      index += 1
+      i
+    elsif i.split[0] == 'label'
+      nil
+    else
+      instr = i.clone
+      labels
+        .to_a
+        .sort { |name, index| name.length }
+        .each { |k, v| p [instr, k, v]; instr[k] &&= (v - index - 2).to_s }
+      index += 2
+      instr
+    end
+  end.compact
+end
+
 if $options[:file]
-  puts File.read($options[:file])
-      .lines
-      .each_with_index
-      .map { |line, i| [line.strip, i] }
-      .reject { |line, i| line.empty? }
-      .flat_map { |line, i| encode i, line }
+  intermediate = File.read($options[:file])
+    .lines
+    .map { |l| l.strip }
+    .reject { |l| l.empty? }
+    .reject { |l| l.start_with? '#' }
+    .map { |l| expand_labels l }
+    .flat_map { |l| encode l }
+  # intermediate.each { |l| p l }
+  # puts "intermediate / expanded"
+  step = expand_labels_relative intermediate
+  step.each { |l| p l }
+  step
+    .flat_map { |l| encode l }
+    .each { |l| p l }
+    .each_slice(8) do |a|
+      a.each { |l| print "0x#{l.to_i(2).to_s(16).rjust(2, '0')}," }
+      puts
+    end
 else
   require 'readline'
   while buf = Readline.readline('> ', true)
