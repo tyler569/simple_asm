@@ -1,8 +1,10 @@
-# Capo Asm
+# simple ASM
 
-Hacky as f assembler
+Simple assembler supporting multiple instruction sets via a
+configuration format.
 
-To run the tests: `ruby as.py -t`
+To assemble the sample file for the PISA ISA: `./as.py -c capo -f capo.asm`
 
-To assemble the sample file: `ruby as.py -f capo.asm`
+To assemble the sample file for the simple16 ISA: `./as.py -f
+simple/call.asm`
 
